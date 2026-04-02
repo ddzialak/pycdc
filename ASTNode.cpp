@@ -1,5 +1,6 @@
 #include "ASTNode.h"
 #include "bytecode.h"
+#include <cstring>
 
 /* ASTNodeList */
 void ASTNodeList::removeLast()
@@ -12,6 +13,31 @@ void ASTNodeList::removeLast()
 void ASTNodeList::removeFirst()
 {
     m_nodes.erase(m_nodes.begin());
+}
+
+void ASTNodeList::removeStoresWithDestNames(const std::initializer_list<const char*>& names)
+{
+    for (auto it = m_nodes.begin(); it != m_nodes.end(); ) {
+        bool erased = false;
+        if ((*it)->type() == ASTNode::NODE_STORE) {
+            PycRef<ASTStore> st = (*it).cast<ASTStore>();
+            if (st->dest().type() == ASTNode::NODE_NAME) {
+                PycRef<PycString> nm = st->dest().cast<ASTName>()->name();
+                if (nm) {
+                    const char* v = nm->value();
+                    for (const char* n : names) {
+                        if (std::strcmp(v, n) == 0) {
+                            it = m_nodes.erase(it);
+                            erased = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!erased)
+            ++it;
+    }
 }
 
 

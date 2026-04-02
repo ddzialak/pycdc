@@ -2,6 +2,7 @@
 #define _PYC_ASTNODE_H
 
 #include "pyc_module.h"
+#include <initializer_list>
 #include <list>
 #include <deque>
 
@@ -72,6 +73,8 @@ public:
     void removeFirst();
     void removeLast();
     void append(PycRef<ASTNode> node) { m_nodes.emplace_back(std::move(node)); }
+    /* Remove assignment statements targeting compiler-inserted names (e.g. 3.13+ class scaffolding). */
+    void removeStoresWithDestNames(const std::initializer_list<const char*>& names);
 
 protected:
     ASTNodeList(list_t nodes, ASTNode::Type type)
