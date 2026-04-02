@@ -257,6 +257,9 @@ public:
     const defarg_t& defargs() const { return m_defargs; }
     const defarg_t& kwdefargs() const { return m_kwdefargs; }
 
+    void setDefargs(defarg_t defargs) { m_defargs = std::move(defargs); }
+    void setKwdefargs(defarg_t kwdefargs) { m_kwdefargs = std::move(kwdefargs); }
+
 private:
     PycRef<ASTNode> m_code;
     defarg_t m_defargs;
@@ -547,6 +550,7 @@ public:
     void removeFirst();
     void removeLast();
     void append(PycRef<ASTNode> node) { m_nodes.emplace_back(std::move(node)); }
+    void setNodes(list_t nodes) { m_nodes = std::move(nodes); }
     const char* type_str() const;
 
     virtual int inited() const { return m_inited; }

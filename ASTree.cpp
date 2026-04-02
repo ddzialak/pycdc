@@ -1,11 +1,16 @@
+#include <algorithm>
 #include <cstring>
 #include <cstdint>
+#include <cctype>
 #include <stdexcept>
 #include <unordered_set>
+#include <vector>
+#include <sstream>
 #include "ASTree.h"
 #include "FastStack.h"
 #include "pyc_numeric.h"
 #include "bytecode.h"
+#include "pyc_sequence.h"
 
 // This must be a triple quote (''' or """), to handle interpolated string literals containing the opposite quote style.
 // E.g. f'''{"interpolated "123' literal"}'''    -> valid.
@@ -14,6 +19,48 @@
 // E.g. f'{"interpolated \"123\' literal"}'      -> invalid, f-string expression does not allow backslash.
 // NOTE: Nested f-strings not supported.
 #define F_STRING_QUOTE "'''"
+
+static PycRef<PycObject> dict_get(PycDict* dict, PycString* key)
+{
+    for (const auto& item : dict->values()) {
+        if (std::get<0>(item)->isEqual(key))
+            return std::get<1>(item);
+    }
+    return nullptr;
+}
+
+static ASTFunction::defarg_t tuple_to_defargs(PycRef<ASTNode> tup)
+{
+    ASTFunction::defarg_t result;
+    if (tup.type() != ASTNode::NODE_OBJECT)
+        return result;
+    PycRef<PycObject> obj = tup.cast<ASTObject>()->object();
+    if (obj.type() != PycObject::TYPE_TUPLE && obj.type() != PycObject::TYPE_SMALL_TUPLE)
+        return result;
+    for (const auto& val : obj.cast<PycTuple>()->values())
+        result.push_back(new ASTObject(val));
+    return result;
+}
+
+static ASTFunction::defarg_t dict_to_kwdefargs(PycRef<ASTNode> dictNode, PycRef<PycCode> code)
+{
+    ASTFunction::defarg_t result;
+    if (dictNode.type() != ASTNode::NODE_OBJECT)
+        return result;
+    PycRef<PycDict> dict = dictNode.cast<ASTObject>()->object().try_cast<PycDict>();
+    if (!dict)
+        return result;
+    int narg = code->argCount();
+    if (code->flags() & PycCode::CO_VARARGS)
+        narg++;
+    for (int i = 0; i < code->kwOnlyArgCount(); ++i) {
+        PycRef<PycString> name = code->getLocal(narg + i);
+        PycRef<PycObject> val = dict_get(dict, name);
+        if (val)
+            result.push_back(new ASTObject(val));
+    }
+    return result;
+}
 
 static void append_to_chain_store(const PycRef<ASTNode>& chainStore,
         PycRef<ASTNode> item, FastStack& stack, const PycRef<ASTBlock>& curblock);
@@ -73,6 +120,66 @@ static void CheckIfExpr(FastStack& stack, PycRef<ASTBlock> curblock)
     stack.push(new ASTTernary(std::move(if_block), std::move(if_expr), std::move(else_expr)));
 }
 
+/* Python 3.11+ lays out try bodies, then "success path" jumps, then exception
+ * handlers. Linear decompilation can produce: stmt; return; except — invalid.
+ * Rewrap into try/except and keep return after the handler group. */
+static bool try_rewrite_return_except_block(PycRef<ASTBlock> block)
+{
+    std::vector<PycRef<ASTNode>> vec(block->nodes().begin(), block->nodes().end());
+    for (size_t i = 0; i + 1 < vec.size(); ++i) {
+        if (vec[i]->type() != ASTNode::NODE_RETURN)
+            continue;
+        if (vec[i + 1]->type() != ASTNode::NODE_BLOCK)
+            continue;
+        PycRef<ASTBlock> ex = vec[i + 1].cast<ASTBlock>();
+        if (ex->blktype() != ASTBlock::BLK_EXCEPT)
+            continue;
+        if (i == 0)
+            continue;
+
+        size_t j = i + 1;
+        while (j < vec.size() && vec[j]->type() == ASTNode::NODE_BLOCK
+                && vec[j].cast<ASTBlock>()->blktype() == ASTBlock::BLK_EXCEPT) {
+            ++j;
+        }
+
+        PycRef<ASTContainerBlock> cont = new ASTContainerBlock(0, 0);
+        PycRef<ASTBlock> tryblock = new ASTBlock(ASTBlock::BLK_TRY, 0, true);
+        tryblock->init();
+        for (size_t k = 0; k < i; ++k)
+            tryblock->append(vec[k]);
+        cont->append(tryblock.cast<ASTNode>());
+        for (size_t k = i + 1; k < j; ++k)
+            cont->append(vec[k]);
+
+        ASTBlock::list_t newlist;
+        newlist.push_back(cont.cast<ASTNode>());
+        newlist.push_back(vec[i]);
+        for (size_t k = j; k < vec.size(); ++k)
+            newlist.push_back(vec[k]);
+        block->setNodes(std::move(newlist));
+        return true;
+    }
+    return false;
+}
+
+static bool fixup_return_before_except_once(PycRef<ASTBlock> block)
+{
+    bool changed = false;
+    for (const auto& node : block->nodes()) {
+        if (node->type() == ASTNode::NODE_BLOCK)
+            changed |= fixup_return_before_except_once(node.cast<ASTBlock>());
+    }
+    changed |= try_rewrite_return_except_block(block);
+    return changed;
+}
+
+static void fixup_return_before_except(PycRef<ASTBlock> block)
+{
+    while (fixup_return_before_except_once(block))
+        ;
+}
+
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 {
     PycBuffer source(code->code()->value(), code->code()->length());
@@ -129,6 +236,14 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 && opcode != Pyc::JUMP_IF_TRUE_OR_POP_A
                 && opcode != Pyc::POP_JUMP_IF_TRUE_A
                 && opcode != Pyc::POP_JUMP_FORWARD_IF_TRUE_A
+                && opcode != Pyc::POP_JUMP_IF_NONE_A
+                && opcode != Pyc::POP_JUMP_IF_NOT_NONE_A
+                && opcode != Pyc::POP_JUMP_BACKWARD_IF_FALSE_A
+                && opcode != Pyc::POP_JUMP_BACKWARD_IF_TRUE_A
+                && opcode != Pyc::POP_JUMP_BACKWARD_IF_NONE_A
+                && opcode != Pyc::POP_JUMP_BACKWARD_IF_NOT_NONE_A
+                && opcode != Pyc::INSTRUMENTED_POP_JUMP_IF_NONE_A
+                && opcode != Pyc::INSTRUMENTED_POP_JUMP_IF_NOT_NONE_A
                 && opcode != Pyc::POP_BLOCK) {
             else_pop = false;
 
@@ -240,6 +355,22 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 PycRef<ASTNode> fun_code = stack.top();
                 stack.pop();
                 stack.push(new ASTFunction(fun_code, {}, {}));
+            }
+            break;
+        case Pyc::MAKE_FUNCTION:
+            {
+                PycRef<ASTNode> fun_code = stack.top();
+                stack.pop();
+
+                int tos_type = fun_code.cast<ASTObject>()->object().type();
+                if (tos_type != PycObject::TYPE_CODE &&
+                        tos_type != PycObject::TYPE_CODE2) {
+                    fun_code = stack.top();
+                    stack.pop();
+                }
+
+                stack.push(new ASTFunction(fun_code, ASTFunction::defarg_t(),
+                        ASTFunction::defarg_t()));
             }
             break;
         case Pyc::BUILD_LIST_A:
@@ -421,6 +552,45 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     stack.pop();
                 }
                 stack.push(new ASTKwNamesMap(kwparamList));
+            }
+            break;
+        case Pyc::CALL_KW_A:
+        case Pyc::INSTRUMENTED_CALL_KW_A:
+            {
+                PycRef<ASTNode> kwnames_node = stack.top();
+                stack.pop();
+                int n_kw = 0;
+                std::vector<PycRef<PycObject>> kw_keys;
+                if (kwnames_node.type() == ASTNode::NODE_OBJECT) {
+                    PycRef<PycObject> ko = kwnames_node.cast<ASTObject>()->object();
+                    if (ko.type() == PycObject::TYPE_TUPLE
+                            || ko.type() == PycObject::TYPE_SMALL_TUPLE) {
+                        n_kw = (int)ko.cast<PycTuple>()->values().size();
+                        for (const auto& k : ko.cast<PycTuple>()->values())
+                            kw_keys.push_back(k);
+                    }
+                }
+                int pparams = operand - n_kw;
+                ASTCall::kwparam_t kwparamList;
+                ASTCall::pparam_t pparamList;
+                std::vector<PycRef<ASTNode>> args;
+                args.reserve(operand);
+                for (int i = 0; i < operand; i++) {
+                    args.push_back(stack.top());
+                    stack.pop();
+                }
+                std::reverse(args.begin(), args.end());
+                for (int i = 0; i < pparams; i++)
+                    pparamList.push_back(args[(size_t)i]);
+                for (int i = 0; i < n_kw; i++) {
+                    PycRef<ASTNode> key = new ASTObject(kw_keys[(size_t)i]);
+                    kwparamList.push_back(std::make_pair(key, args[(size_t)(pparams + i)]));
+                }
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+                if (stack.top() == nullptr)
+                    stack.pop();
+                stack.push(new ASTCall(func, pparamList, kwparamList));
             }
             break;
         case Pyc::CALL_A:
@@ -994,11 +1164,141 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 stack.push(new ASTFormattedValue(val, conversion_flag, format_spec));
             }
             break;
+        case Pyc::FORMAT_SIMPLE:
+            /* str/unicode formatting; stack shape matches the value. */
+            break;
+        case Pyc::FORMAT_WITH_SPEC:
+            {
+                PycRef<ASTNode> fmt_spec = stack.top();
+                stack.pop();
+                PycRef<ASTNode> val = stack.top();
+                stack.pop();
+                auto conv = static_cast<ASTFormattedValue::ConversionFlag>(
+                        ASTFormattedValue::NONE | ASTFormattedValue::HAVE_FMT_SPEC);
+                stack.push(new ASTFormattedValue(val, conv, fmt_spec));
+            }
+            break;
         case Pyc::GET_AWAITABLE:
             {
                 PycRef<ASTNode> object = stack.top();
                 stack.pop();
                 stack.push(new ASTAwaitable(object));
+            }
+            break;
+        case Pyc::SEND_A:
+            {
+                PycRef<ASTNode> v = stack.top();
+                stack.pop();
+                PycRef<ASTNode> receiver = stack.top();
+                stack.pop();
+                PycRef<PycString> sendName = new PycString;
+                sendName->setValue("send");
+                ASTCall::pparam_t pp;
+                pp.push_back(v);
+                stack.push(receiver);
+                stack.push(new ASTCall(
+                        new ASTBinary(receiver, new ASTName(sendName), ASTBinary::BIN_ATTR),
+                        pp, ASTCall::kwparam_t()));
+            }
+            break;
+        case Pyc::DICT_MERGE_A:
+            {
+                PycRef<ASTNode> update = stack.top();
+                stack.pop();
+                PycRef<ASTNode> dict = stack.top();
+                stack.pop();
+                stack.push(dict);
+            }
+            break;
+        case Pyc::CALL_INTRINSIC_1_A:
+            {
+                PycRef<ASTNode> arg = stack.top();
+                stack.pop();
+                stack.push(arg);
+            }
+            break;
+        case Pyc::CALL_INTRINSIC_2_A:
+            {
+                PycRef<ASTNode> a = stack.top();
+                stack.pop();
+                stack.pop();
+                stack.push(a);
+            }
+            break;
+        case Pyc::LOAD_SUPER_ATTR_A:
+        case Pyc::INSTRUMENTED_LOAD_SUPER_ATTR_A:
+            {
+                PycRef<ASTNode> self = stack.top();
+                stack.pop();
+                PycRef<ASTNode> cls = stack.top();
+                stack.pop();
+                stack.pop();
+                PycRef<PycString> superStr = new PycString;
+                superStr->setValue("super");
+                ASTCall::pparam_t pp;
+                pp.push_back(cls);
+                pp.push_back(self);
+                PycRef<ASTNode> supCall = new ASTCall(new ASTName(superStr), pp, ASTCall::kwparam_t());
+                stack.push(new ASTBinary(supCall, new ASTName(code->getName(operand >> 2)),
+                        ASTBinary::BIN_ATTR));
+            }
+            break;
+        case Pyc::CALL_FUNCTION_EX_A:
+        case Pyc::INSTRUMENTED_CALL_FUNCTION_EX_A:
+            {
+                PycRef<ASTNode> kwargs;
+                PycRef<ASTNode> callargs;
+                if (operand & 1) {
+                    kwargs = stack.top();
+                    stack.pop();
+                }
+                callargs = stack.top();
+                stack.pop();
+                stack.pop();
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+                ASTCall::pparam_t pparam;
+                pparam.push_back(callargs);
+                PycRef<ASTNode> call = new ASTCall(func, pparam, ASTCall::kwparam_t());
+                if (kwargs)
+                    call.cast<ASTCall>()->setKW(kwargs);
+                stack.push(call);
+            }
+            break;
+        case Pyc::MAP_ADD_A:
+            {
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                PycRef<ASTNode> key = stack.top();
+                stack.pop();
+                PycRef<ASTNode> dict = stack.top();
+                if (curblock->blktype() == ASTBlock::BLK_FOR
+                        && curblock.cast<ASTIterBlock>()->isComprehension()) {
+                    stack.pop();
+                    stack.push(new ASTComprehension(value));
+                } else {
+                    curblock->append(new ASTStore(value, new ASTSubscr(dict, key)));
+                }
+            }
+            break;
+        case Pyc::END_SEND:
+        case Pyc::INSTRUMENTED_END_SEND_A:
+            {
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                PycRef<ASTNode> receiver = stack.top();
+                stack.pop();
+                stack.push(value);
+            }
+            break;
+        case Pyc::CLEANUP_THROW:
+            {
+                PycRef<ASTNode> exc_value = stack.top();
+                stack.pop();
+                stack.pop();
+                stack.pop();
+                stack.push(new ASTObject(Pyc_None));
+                stack.push(exc_value);
             }
             break;
         case Pyc::GET_ITER:
@@ -1036,6 +1336,15 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 stack.push(new ASTCompare(left, right, operand ? ASTCompare::CMP_IS_NOT : ASTCompare::CMP_IS));
             }
             break;
+        case Pyc::CHECK_EXC_MATCH:
+            {
+                PycRef<ASTNode> exc_type = stack.top();
+                stack.pop();
+                PycRef<ASTNode> exc = stack.top();
+                stack.pop();
+                stack.push(new ASTCompare(exc, exc_type, ASTCompare::CMP_EXCEPTION));
+            }
+            break;
         case Pyc::JUMP_IF_FALSE_A:
         case Pyc::JUMP_IF_TRUE_A:
         case Pyc::JUMP_IF_FALSE_OR_POP_A:
@@ -1044,17 +1353,43 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         case Pyc::POP_JUMP_IF_TRUE_A:
         case Pyc::POP_JUMP_FORWARD_IF_FALSE_A:
         case Pyc::POP_JUMP_FORWARD_IF_TRUE_A:
+        case Pyc::POP_JUMP_IF_NONE_A:
+        case Pyc::POP_JUMP_IF_NOT_NONE_A:
+        case Pyc::POP_JUMP_BACKWARD_IF_FALSE_A:
+        case Pyc::POP_JUMP_BACKWARD_IF_TRUE_A:
+        case Pyc::POP_JUMP_BACKWARD_IF_NONE_A:
+        case Pyc::POP_JUMP_BACKWARD_IF_NOT_NONE_A:
         case Pyc::INSTRUMENTED_POP_JUMP_IF_FALSE_A:
         case Pyc::INSTRUMENTED_POP_JUMP_IF_TRUE_A:
+        case Pyc::INSTRUMENTED_POP_JUMP_IF_NONE_A:
+        case Pyc::INSTRUMENTED_POP_JUMP_IF_NOT_NONE_A:
             {
                 PycRef<ASTNode> cond = stack.top();
                 PycRef<ASTCondBlock> ifblk;
                 int popped = ASTCondBlock::UNINITED;
 
-                if (opcode == Pyc::POP_JUMP_IF_FALSE_A
+                if (opcode == Pyc::POP_JUMP_IF_NONE_A
+                        || opcode == Pyc::INSTRUMENTED_POP_JUMP_IF_NONE_A
+                        || opcode == Pyc::POP_JUMP_BACKWARD_IF_NONE_A) {
+                    stack.pop();
+                    PycRef<ASTNode> val = cond;
+                    cond = new ASTCompare(val, new ASTObject(Pyc_None),
+                            ASTCompare::CMP_IS_NOT);
+                    popped = ASTCondBlock::PRE_POPPED;
+                } else if (opcode == Pyc::POP_JUMP_IF_NOT_NONE_A
+                        || opcode == Pyc::INSTRUMENTED_POP_JUMP_IF_NOT_NONE_A
+                        || opcode == Pyc::POP_JUMP_BACKWARD_IF_NOT_NONE_A) {
+                    stack.pop();
+                    PycRef<ASTNode> val = cond;
+                    cond = new ASTCompare(val, new ASTObject(Pyc_None),
+                            ASTCompare::CMP_IS);
+                    popped = ASTCondBlock::PRE_POPPED;
+                } else if (opcode == Pyc::POP_JUMP_IF_FALSE_A
                         || opcode == Pyc::POP_JUMP_IF_TRUE_A
                         || opcode == Pyc::POP_JUMP_FORWARD_IF_FALSE_A
                         || opcode == Pyc::POP_JUMP_FORWARD_IF_TRUE_A
+                        || opcode == Pyc::POP_JUMP_BACKWARD_IF_FALSE_A
+                        || opcode == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A
                         || opcode == Pyc::INSTRUMENTED_POP_JUMP_IF_FALSE_A
                         || opcode == Pyc::INSTRUMENTED_POP_JUMP_IF_TRUE_A) {
                     /* Pop condition before the jump */
@@ -1077,12 +1412,18 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                         || opcode == Pyc::JUMP_IF_TRUE_OR_POP_A
                         || opcode == Pyc::POP_JUMP_IF_TRUE_A
                         || opcode == Pyc::POP_JUMP_FORWARD_IF_TRUE_A
+                        || opcode == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A
                         || opcode == Pyc::INSTRUMENTED_POP_JUMP_IF_TRUE_A;
 
                 int offs = operand;
                 if (mod->verCompare(3, 10) >= 0)
                     offs *= sizeof(uint16_t); // // BPO-27129
-                if (mod->verCompare(3, 12) >= 0
+                if (opcode == Pyc::POP_JUMP_BACKWARD_IF_FALSE_A
+                        || opcode == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A
+                        || opcode == Pyc::POP_JUMP_BACKWARD_IF_NONE_A
+                        || opcode == Pyc::POP_JUMP_BACKWARD_IF_NOT_NONE_A) {
+                    offs = pos - offs;
+                } else if (mod->verCompare(3, 12) >= 0
                         || opcode == Pyc::JUMP_IF_FALSE_A
                         || opcode == Pyc::JUMP_IF_TRUE_A
                         || opcode == Pyc::POP_JUMP_FORWARD_IF_TRUE_A
@@ -1419,6 +1760,21 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 }
             }
             break;
+        case Pyc::SET_ADD:
+        case Pyc::SET_ADD_A:
+            {
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                PycRef<ASTNode> set = stack.top();
+                if (curblock->blktype() == ASTBlock::BLK_FOR
+                        && curblock.cast<ASTIterBlock>()->isComprehension()) {
+                    stack.pop();
+                    stack.push(new ASTComprehension(value));
+                } else {
+                    stack.push(new ASTSubscr(set, value)); /* same pattern as LIST_APPEND */
+                }
+            }
+            break;
         case Pyc::SET_UPDATE_A:
             {
                 PycRef<ASTNode> rhs = stack.top();
@@ -1499,6 +1855,12 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         case Pyc::LOAD_CLOSURE_A:
             /* Ignore this */
             break;
+        case Pyc::MAKE_CELL_A:
+            /* Creates a cell in locals; no stack effect. */
+            break;
+        case Pyc::COPY_FREE_VARS_A:
+            /* Initializes closure cells from arguments; no stack effect. */
+            break;
         case Pyc::LOAD_CONST_A:
             {
                 PycRef<ASTObject> t_ob = new ASTObject(code->getConst(operand));
@@ -1525,9 +1887,39 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             else
                 stack.push(new ASTName(code->getLocal(operand)));
             break;
+        case Pyc::LOAD_FAST_AND_CLEAR_A:
+            if (mod->verCompare(1, 3) < 0)
+                stack.push(new ASTName(code->getName(operand)));
+            else
+                stack.push(new ASTName(code->getLocal(operand)));
+            break;
+        case Pyc::LOAD_FAST_CHECK_A:
+            if (mod->verCompare(1, 3) < 0)
+                stack.push(new ASTName(code->getName(operand)));
+            else
+                stack.push(new ASTName(code->getLocal(operand)));
+            break;
         case Pyc::LOAD_FAST_LOAD_FAST_A:
             stack.push(new ASTName(code->getLocal(operand >> 4)));
             stack.push(new ASTName(code->getLocal(operand & 0xF)));
+            break;
+        case Pyc::STORE_FAST_STORE_FAST_A:
+            {
+                PycRef<ASTNode> value1 = stack.top();
+                stack.pop();
+                PycRef<ASTNode> value2 = stack.top();
+                stack.pop();
+                curblock->append(new ASTStore(value1, new ASTName(code->getLocal(operand >> 4))));
+                curblock->append(new ASTStore(value2, new ASTName(code->getLocal(operand & 0xF))));
+            }
+            break;
+        case Pyc::STORE_FAST_LOAD_FAST_A:
+            {
+                PycRef<ASTNode> value1 = stack.top();
+                stack.pop();
+                curblock->append(new ASTStore(value1, new ASTName(code->getLocal(operand >> 4))));
+                stack.push(new ASTName(code->getLocal(operand & 0xF)));
+            }
             break;
         case Pyc::LOAD_GLOBAL_A:
             if (mod->verCompare(3, 11) >= 0) {
@@ -1585,6 +1977,38 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     stack.pop();
                 }
                 stack.push(new ASTFunction(fun_code, defArgs, kwDefArgs));
+            }
+            break;
+        case Pyc::SET_FUNCTION_ATTRIBUTE_A:
+            {
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+                PycRef<ASTNode> attr = stack.top();
+                stack.pop();
+                if (func.type() == ASTNode::NODE_FUNCTION) {
+                    PycRef<ASTFunction> fn = func.cast<ASTFunction>();
+                    PycRef<ASTNode> codeNode = fn->code();
+                    if (codeNode.type() == ASTNode::NODE_OBJECT) {
+                        PycRef<PycCode> code_src = codeNode.cast<ASTObject>()
+                                ->object().try_cast<PycCode>();
+                        if (code_src) {
+                            switch (operand) {
+                            case 0x01:
+                                fn->setDefargs(tuple_to_defargs(attr));
+                                break;
+                            case 0x02:
+                                fn->setKwdefargs(dict_to_kwdefargs(attr, code_src));
+                                break;
+                            case 0x04:
+                            case 0x08:
+                                break;
+                            default:
+                                break;
+                            }
+                        }
+                    }
+                }
+                stack.push(func);
             }
             break;
         case Pyc::NOP:
@@ -1830,6 +2254,17 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 }
             }
             break;
+        case Pyc::RERAISE:
+        case Pyc::RERAISE_A:
+            {
+                ASTRaise::param_t paramList;
+                for (int i = 0; i < operand; i++) {
+                    paramList.push_front(stack.top());
+                    stack.pop();
+                }
+                curblock->append(new ASTRaise(paramList));
+            }
+            break;
         case Pyc::RETURN_VALUE:
         case Pyc::INSTRUMENTED_RETURN_VALUE_A:
             {
@@ -1918,6 +2353,18 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 PycRef<ASTBlock> withblock = new ASTWithBlock(pos+operand);
                 blocks.push(withblock);
                 curblock = blocks.top();
+            }
+            break;
+        case Pyc::BEFORE_WITH:
+        case Pyc::BEFORE_ASYNC_WITH:
+            {
+                PycRef<ASTBlock> withblock = new ASTWithBlock(pos);
+                blocks.push(withblock);
+                curblock = blocks.top();
+                PycRef<ASTNode> mgr = stack.top();
+                stack.pop();
+                stack.push(mgr);
+                stack.push(mgr);
             }
             break;
         case Pyc::WITH_CLEANUP:
@@ -2418,6 +2865,10 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 stack.push(new ASTUnary(arg, ASTUnary::UN_NOT));
             }
             break;
+        case Pyc::TO_BOOL:
+            /* Python 3.13+: explicit truth-value test; stack is unchanged for
+               decompilation (conditions should stay as the source expression). */
+            break;
         case Pyc::UNARY_POSITIVE:
             {
                 PycRef<ASTNode> arg = stack.top();
@@ -2466,6 +2917,7 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             }
             break;
         case Pyc::YIELD_VALUE:
+        case Pyc::YIELD_VALUE_A:
         case Pyc::INSTRUMENTED_YIELD_VALUE_A:
             {
                 PycRef<ASTNode> value = stack.top();
@@ -2479,6 +2931,7 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         case Pyc::PRECALL_A:
         case Pyc::RESUME_A:
         case Pyc::INSTRUMENTED_RESUME_A:
+        case Pyc::RETURN_GENERATOR:
             /* We just entirely ignore this / no-op */
             break;
         case Pyc::CACHE:
@@ -2489,6 +2942,14 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             break;
         case Pyc::PUSH_NULL:
             stack.push(nullptr);
+            break;
+        case Pyc::PUSH_EXC_INFO:
+            {
+                PycRef<ASTNode> new_exc = stack.top();
+                stack.pop();
+                stack.push(new ASTObject(Pyc_None));
+                stack.push(new_exc);
+            }
             break;
         case Pyc::GEN_START_A:
             stack.pop();
@@ -2614,6 +3075,9 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             blocks.top()->append(tmp.cast<ASTNode>());
         }
     }
+
+    if (mod->verCompare(3, 11) >= 0)
+        fixup_return_before_except(defblock);
 
     cleanBuild = true;
     return new ASTNodeList(defblock->nodes());
@@ -2782,6 +3246,16 @@ void print_formatted_value(PycRef<ASTFormattedValue> formatted_value, PycModule*
 
 static std::unordered_set<ASTNode *> node_seen;
 
+/* Compiler temps like ".0" are not valid Python identifiers. */
+static void print_py_identifier(const PycRef<PycString>& name, std::ostream& pyc_output)
+{
+    const std::string& s = name->strValue();
+    if (!s.empty() && s[0] == '.')
+        pyc_output << '_' << (s.c_str() + 1);
+    else
+        pyc_output << s;
+}
+
 void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
 {
     if (node == NULL) {
@@ -2792,6 +3266,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
 
     if (node_seen.find((ASTNode *)node) != node_seen.end()) {
         fputs("WARNING: Circular reference detected\n", stderr);
+        /* Must emit valid syntax; empty output breaks e.g. `for x in ` */
+        pyc_output << "...";
         return;
     }
     node_seen.insert((ASTNode *)node);
@@ -2949,7 +3425,13 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
 
             for (const auto& gen : comp->generators()) {
                 pyc_output << " for ";
-                print_src(gen->index(), mod, pyc_output);
+                {
+                    PycRef<ASTNode> idx = gen->index();
+                    if (idx == nullptr)
+                        pyc_output << "_";
+                    else
+                        print_src(idx, mod, pyc_output);
+                }
                 pyc_output << " in ";
                 print_src(gen->iter(), mod, pyc_output);
                 if (gen->condition()) {
@@ -2999,7 +3481,7 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
         }
         break;
     case ASTNode::NODE_NAME:
-        pyc_output << node.cast<ASTName>()->name()->value();
+        print_py_identifier(node.cast<ASTName>()->name(), pyc_output);
         break;
     case ASTNode::NODE_NODELIST:
         {
@@ -3039,9 +3521,34 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 print_src(blk.cast<ASTCondBlock>()->cond(), mod, pyc_output);
             } else if (blk->blktype() == ASTBlock::BLK_FOR || blk->blktype() == ASTBlock::BLK_ASYNCFOR) {
                 pyc_output << " ";
-                print_src(blk.cast<ASTIterBlock>()->index(), mod, pyc_output);
+                {
+                    PycRef<ASTNode> idx = blk.cast<ASTIterBlock>()->index();
+                    if (idx == nullptr)
+                        pyc_output << "_";
+                    else
+                        print_src(idx, mod, pyc_output);
+                }
                 pyc_output << " in ";
-                print_src(blk.cast<ASTIterBlock>()->iter(), mod, pyc_output);
+                {
+                    PycRef<ASTNode> iter = blk.cast<ASTIterBlock>()->iter();
+                    if (iter == NULL) {
+                        pyc_output << "()";
+                    } else if (iter->type() == ASTNode::NODE_NODELIST
+                            && iter.cast<ASTNodeList>()->nodes().empty()) {
+                        /* e.g. 3.13 setcomp / nested GET_ITER — lost iterable */
+                        pyc_output << "()";
+                    } else if (iter->type() == ASTNode::NODE_BLOCK
+                            && iter.cast<ASTBlock>()->blktype() == ASTBlock::BLK_ELSE
+                            && iter.cast<ASTBlock>()->size() == 0) {
+                        /* print_src skips empty else blocks entirely */
+                        pyc_output << "()";
+                    } else {
+                        std::streampos before = pyc_output.tellp();
+                        print_src(iter, mod, pyc_output);
+                        if (pyc_output.tellp() == before)
+                            pyc_output << "()";
+                    }
+                }
             } else if (blk->blktype() == ASTBlock::BLK_EXCEPT &&
                     blk.cast<ASTCondBlock>()->cond() != NULL) {
                 pyc_output << " ";
@@ -3067,6 +3574,10 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             PycRef<PycObject> obj = node.cast<ASTObject>()->object();
             if (obj.type() == PycObject::TYPE_CODE) {
                 PycRef<PycCode> code = obj.cast<PycCode>();
+                /* NODE_FUNCTION sets inLambda while printing lambda bodies; still
+                 * decompile nested code here so simple expression lambdas (e.g. in
+                 * f-strings) print correctly. Multi-statement nested lambdas may
+                 * still produce invalid syntax. */
                 decompyle(code, mod, pyc_output);
             } else {
                 print_const(pyc_output, obj, mod);
@@ -3096,13 +3607,27 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
     case ASTNode::NODE_RAISE:
         {
             PycRef<ASTRaise> raise = node.cast<ASTRaise>();
-            pyc_output << "raise ";
-            bool first = true;
-            for (const auto& param : raise->params()) {
-                if (!first)
-                    pyc_output << ", ";
-                print_src(param, mod, pyc_output);
-                first = false;
+            const ASTRaise::param_t& params = raise->params();
+            if (params.empty()) {
+                pyc_output << "raise";
+            } else if (mod->majorVer() >= 3) {
+                pyc_output << "raise ";
+                auto it = params.begin();
+                print_src(*it, mod, pyc_output);
+                ++it;
+                if (it != params.end()) {
+                    pyc_output << " from ";
+                    print_src(*it, mod, pyc_output);
+                }
+            } else {
+                pyc_output << "raise ";
+                bool first = true;
+                for (const auto& param : params) {
+                    if (!first)
+                        pyc_output << ", ";
+                    print_src(param, mod, pyc_output);
+                    first = false;
+                }
             }
         }
         break;
@@ -3199,7 +3724,7 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             for (int i=0; i<code_src->argCount(); i++) {
                 if (narg)
                     pyc_output << ", ";
-                pyc_output << code_src->getLocal(narg++)->value();
+                print_py_identifier(code_src->getLocal(narg++), pyc_output);
                 if ((code_src->argCount() - i) <= (int)defargs.size()) {
                     pyc_output << " = ";
                     print_src(*da++, mod, pyc_output);
@@ -3208,9 +3733,9 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             da = kwdefargs.cbegin();
             if (code_src->kwOnlyArgCount() != 0) {
                 pyc_output << (narg == 0 ? "*" : ", *");
-                for (int i = 0; i < code_src->argCount(); i++) {
+                for (int i = 0; i < code_src->kwOnlyArgCount(); i++) {
                     pyc_output << ", ";
-                    pyc_output << code_src->getLocal(narg++)->value();
+                    print_py_identifier(code_src->getLocal(narg++), pyc_output);
                     if ((code_src->kwOnlyArgCount() - i) <= (int)kwdefargs.size()) {
                         pyc_output << " = ";
                         print_src(*da++, mod, pyc_output);
@@ -3258,7 +3783,7 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 for (int i = 0; i < code_src->argCount(); ++i) {
                     if (narg)
                         pyc_output << ", ";
-                    pyc_output << code_src->getLocal(narg++)->value();
+                    print_py_identifier(code_src->getLocal(narg++), pyc_output);
                     if ((code_src->argCount() - i) <= (int)defargs.size()) {
                         pyc_output << " = ";
                         print_src(*da++, mod, pyc_output);
@@ -3269,7 +3794,7 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     pyc_output << (narg == 0 ? "*" : ", *");
                     for (int i = 0; i < code_src->kwOnlyArgCount(); ++i) {
                         pyc_output << ", ";
-                        pyc_output << code_src->getLocal(narg++)->value();
+                        print_py_identifier(code_src->getLocal(narg++), pyc_output);
                         if ((code_src->kwOnlyArgCount() - i) <= (int)kwdefargs.size()) {
                             pyc_output << " = ";
                             print_src(*da++, mod, pyc_output);
@@ -3279,12 +3804,14 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 if (code_src->flags() & PycCode::CO_VARARGS) {
                     if (narg)
                         pyc_output << ", ";
-                    pyc_output << "*" << code_src->getLocal(narg++)->value();
+                    pyc_output << "*";
+                    print_py_identifier(code_src->getLocal(narg++), pyc_output);
                 }
                 if (code_src->flags() & PycCode::CO_VARKEYWORDS) {
                     if (narg)
                         pyc_output << ", ";
-                    pyc_output << "**" << code_src->getLocal(narg++)->value();
+                    pyc_output << "**";
+                    print_py_identifier(code_src->getLocal(narg++), pyc_output);
                 }
 
                 if (isLambda) {
@@ -3363,20 +3890,64 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             } else if (src.type() == ASTNode::NODE_BINARY
                     && src.cast<ASTBinary>()->is_inplace()) {
                 print_src(src, mod, pyc_output);
-            } else {
-                print_src(dest, mod, pyc_output);
-                pyc_output << " = ";
+            } else if (dest.type() == ASTNode::NODE_CALL) {
+                /* e.g. genexp/setcomp lowering — not valid as assignment target */
+                start_line(cur_indent, pyc_output);
                 print_src(src, mod, pyc_output);
+            } else {
+                std::ostringstream dl, sr;
+                print_src(dest, mod, dl);
+                print_src(src, mod, sr);
+                std::string ds = dl.str();
+                size_t p = 0;
+                while (p < ds.size()
+                        && (std::isspace(static_cast<unsigned char>(ds[p])) || ds[p] == ',')) {
+                    ++p;
+                }
+                ds.erase(0, p);
+                /* 3.13+ setcomp / SWAP unpack sometimes yields invalid targets like "{}, a, b" */
+                if (ds.empty() || (ds.size() >= 2 && ds[0] == '{' && ds[1] == '}')) {
+                    start_line(cur_indent, pyc_output);
+                    pyc_output << "pass";
+                } else {
+                    pyc_output << ds;
+                    pyc_output << " = ";
+                    pyc_output << sr.str();
+                }
             }
         }
         break;
     case ASTNode::NODE_CHAINSTORE:
         {
-            for (auto& dest : node.cast<ASTChainStore>()->nodes()) {
-                print_src(dest, mod, pyc_output);
+            PycRef<ASTChainStore> cs = node.cast<ASTChainStore>();
+            std::vector<std::string> lhs_parts;
+            for (auto& dest : cs->nodes()) {
+                if (dest == NULL)
+                    continue;
+                std::ostringstream o;
+                print_src(dest, mod, o);
+                std::string s = o.str();
+                size_t p = 0;
+                while (p < s.size()
+                        && (std::isspace(static_cast<unsigned char>(s[p])) || s[p] == ',')) {
+                    ++p;
+                }
+                s.erase(0, p);
+                if (!s.empty())
+                    lhs_parts.push_back(std::move(s));
+            }
+            std::ostringstream rhsbuf;
+            print_src(cs->src(), mod, rhsbuf);
+            const std::string& rhs = rhsbuf.str();
+            if (!lhs_parts.empty()) {
+                for (size_t i = 0; i < lhs_parts.size(); ++i) {
+                    if (i)
+                        pyc_output << " = ";
+                    pyc_output << lhs_parts[i];
+                }
                 pyc_output << " = ";
             }
-            print_src(node.cast<ASTChainStore>()->src(), mod, pyc_output);
+            pyc_output << rhs;
         }
         break;
     case ASTNode::NODE_SUBSCR:
